@@ -75,9 +75,11 @@ namespace System.Linq.Dynamic.Core
         {
             var assemblyName = new AssemblyName("System.Linq.Dynamic.Core.DynamicClasses, Version=1.0.0.0");
             AssemblyBuilder = AssemblyBuilderFactory.DefineDynamicAssembly(assemblyName, AssemblyBuilderAccess.Run);
+            DynamicModule = AssemblyBuilder.DefineDynamicModule(DefaultModuleName);
         }
 
         private static AssemblyBuilder AssemblyBuilder { get; }
+        private static ModuleBuilder DynamicModule { get; }
 
         /// <summary>
         /// The CreateType method creates a new data class with a given set of public properties and returns the System.Type object for the newly created class. If a data class with an identical sequence of properties has already been created, the System.Type object for this class is returned.        
@@ -100,41 +102,46 @@ namespace System.Linq.Dynamic.Core
         /// ]]>
         /// </code>
         /// </example>
-        public static Type CreateType([NotNull] IList<DynamicProperty> properties, bool createParameterCtor = true)
+        public static Type CreateType([NotNull] List<DynamicProperty> properties, bool createParameterCtor = true)
         {
-            return CreateType(properties, null, null, null, createParameterCtor);
+            var classDefinition = new DynamicClassDefinition(properties.OfType<DynamicPropertyBase>().ToList(), null, null, null, createParameterCtor);
+            CreateTypes(new [] { classDefinition });
+            return classDefinition.ResolveType();
         }
 
-        public static Type CreateType([NotNull] IList<DynamicProperty> properties, string @namespace = null, string typeName = null, Type baseType = null, bool createParameterCtor = true)
+        public static void CreateTypes([NotNull] IList<DynamicClassDefinition> classDefinitions)
         {
-            Check.HasNoNulls(properties, nameof(properties));
+            Check.NotNull(classDefinitions, nameof(classDefinitions));
+            Check.HasNoNulls(classDefinitions, nameof(classDefinitions));
 
-            bool typeNameProvided = !string.IsNullOrEmpty(typeName);
-            baseType = baseType ?? typeof(DynamicClass);
-            @namespace = @namespace ?? DefaultModuleName;
-
-            Type[] types = properties.Select(p => p.Type).ToArray();
-            string[] names = properties.Select(p => p.Name).ToArray();
-
-            Module module = ResolveModule(@namespace);
-            ConcurrentDictionary<string, Type> generatedTypes = module.GeneratedTypes;
-
-            // Anonymous classes are generics based. The generic classes are distinguished by number of parameters and name of parameters.
-            // The specific types of the parameters are the generic arguments.
-            // We recreate this by creating a fullName composed of all the property names, separated by a "|".
-            string typeKey = (typeNameProvided ? typeName : string.Join("|", names.Select(Escape).ToArray()))
-                  + "|_" + (createParameterCtor ? "1" : "0");
-
-            Type type = generatedTypes.GetOrAdd(typeKey, fn =>
+            var transientTypeCache = new HashSet<object>();
+            foreach (var definition in classDefinitions)
             {
+                string typeName = definition.Name;
+                string ns = definition.Namespace ?? DefaultModuleName;
+                Type baseType = definition.BaseType ?? typeof(DynamicClass);
+
+                bool typeNameProvided = !string.IsNullOrEmpty(typeName);
+                string[] names = definition.Properties
+                    .Select(p => p.Name)
+                    .ToArray();
+
+                string typeKey = (typeNameProvided ? typeName : string.Join("|", names.Select(Escape).ToArray()))
+                                 + "|_" + (definition.CreateParameterConstructor ? "1" : "0");
+
+                // resolve on cache hit using typeKey
+
                 long index = Interlocked.Increment(ref _index);
+
+                Module module = ResolveModule(ns);
+                ConcurrentDictionary<string, Type> generatedTypes = module.GeneratedTypes;
 
                 string name = typeNameProvided
                     ? typeName
                     : names.Length != 0 ? $"<>f__AnonymousType{index}`{names.Length}" : $"<>f__AnonymousType{index}";
 
                 string fullName = typeNameProvided
-                    ? $"{@namespace}.{name}"
+                    ? $"{ns}.{name}"
                     : name;
 
                 ModuleBuilder moduleBuilder = module.ModuleBuilder;
@@ -143,6 +150,21 @@ namespace System.Linq.Dynamic.Core
                     TypeAttributes.AutoLayout | TypeAttributes.BeforeFieldInit, baseType);
 
                 tb.SetCustomAttribute(CompilerGeneratedAttributeBuilder);
+
+                definition.ResolvedType = tb;
+                transientTypeCache.Add(definition.ResolvedType);
+            }
+
+            foreach (var definition in classDefinitions)
+            {
+                List<DynamicPropertyBase> properties = definition.Properties;
+                string typeName = definition.Name;
+                bool typeNameProvided = !string.IsNullOrEmpty(typeName);
+                string[] names = definition.Properties
+                    .Select(p => p.Name)
+                    .ToArray();
+
+                var tb = definition.ResolvedType as TypeBuilder;
 
                 GenericTypeParameterBuilder[] generics;
 
@@ -162,6 +184,8 @@ namespace System.Linq.Dynamic.Core
                 }
 
                 FieldBuilder[] fields = new FieldBuilder[names.Length];
+                Type[] types = properties.Select(p => p.ResolveType())
+                    .ToArray();
 
                 // There are two for cycles because we want to have all the getter methods before all the other methods
                 for (int i = 0; i < names.Length; i++)
@@ -249,16 +273,18 @@ namespace System.Linq.Dynamic.Core
                 {
                     Type memberType = typeNameProvided ? types[i] : generics[i].AsType();
                     Type equalityComparerT = EqualityComparer.MakeGenericType(memberType);
+                    bool isTransientType = transientTypeCache.Contains(memberType)
+                        || (memberType.GetGenericArguments().Any(x => transientTypeCache.Contains(x)));
 
                     // Equals()
                     MethodInfo equalityComparerTDefault;
                     MethodInfo equalityComparerTEquals;
                     MethodInfo equalityComparerTGetHashCode;
-                    if (typeNameProvided)
+                    if (typeNameProvided && !isTransientType)
                     {
                         equalityComparerTDefault = equalityComparerT.GetMethod(EqualityComparerDefault.Name, BindingFlags.Static | BindingFlags.Public);
-                        equalityComparerTEquals = equalityComparerT.GetMethod(EqualityComparerEquals.Name, new [] { memberType, memberType });
-                        equalityComparerTGetHashCode = equalityComparerT.GetMethod(EqualityComparerGetHashCode.Name, new [] { memberType });
+                        equalityComparerTEquals = equalityComparerT.GetMethod(EqualityComparerEquals.Name, new[] { memberType, memberType });
+                        equalityComparerTGetHashCode = equalityComparerT.GetMethod(EqualityComparerGetHashCode.Name, new[] { memberType });
                     }
                     else
                     {
@@ -301,7 +327,7 @@ namespace System.Linq.Dynamic.Core
                     ilgeneratorToString.Emit(OpCodes.Pop);
                 }
 
-                if (createParameterCtor)
+                if (definition.CreateParameterConstructor)
                 {
                     // .ctor default
                     ConstructorBuilder constructorDef = tb.DefineConstructor(MethodAttributes.Public | MethodAttributes.HideBySig, CallingConventions.HasThis, EmptyTypes);
@@ -384,6 +410,24 @@ namespace System.Linq.Dynamic.Core
                 ilgeneratorToString.Emit(OpCodes.Ldloc_0);
                 ilgeneratorToString.Emit(OpCodes.Callvirt, ObjectToString);
                 ilgeneratorToString.Emit(OpCodes.Ret);
+            }
+
+            foreach (var definition in classDefinitions)
+            {
+                var typeBuilder = definition.ResolvedType as TypeBuilder;
+                definition.ResolvedType = typeBuilder.CreateType();
+            }
+
+            // Anonymous classes are generics based. The generic classes are distinguished by number of parameters and name of parameters.
+            // The specific types of the parameters are the generic arguments.
+            // We recreate this by creating a fullName composed of all the property names, separated by a "|".
+
+            /*
+            Type type = generatedTypes.GetOrAdd(typeKey, fn =>
+            {
+
+
+
 
                 type = tb.CreateType();
                 return type;
@@ -394,7 +438,7 @@ namespace System.Linq.Dynamic.Core
                 type = type.MakeGenericType(types);
             }
 
-            return type;
+            return type;*/
         }
 
         private static Module ResolveModule(string @namespace)
@@ -402,7 +446,7 @@ namespace System.Linq.Dynamic.Core
             return GeneratedModules.GetOrAdd(@namespace, ns => new Module
             {
                 Namespace = @namespace,
-                ModuleBuilder = AssemblyBuilder.DefineDynamicModule(ns)
+                ModuleBuilder = DynamicModule
             });
         }
 
