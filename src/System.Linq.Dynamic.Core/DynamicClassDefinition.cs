@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Reflection;
 using JetBrains.Annotations;
 
 namespace System.Linq.Dynamic.Core
@@ -26,6 +27,11 @@ namespace System.Linq.Dynamic.Core
         public Type ResolveType()
         {
             return ResolvedType as Type;
+        }
+
+        public DynamicClass New(params object[] arguments)
+        {
+            return Activator.CreateInstance(ResolveType(), arguments) as DynamicClass;
         }
     }
 }

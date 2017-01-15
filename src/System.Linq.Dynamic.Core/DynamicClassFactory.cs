@@ -127,7 +127,7 @@ namespace System.Linq.Dynamic.Core
                     .ToArray();
 
                 string typeKey = (typeNameProvided ? typeName : string.Join("|", names.Select(Escape).ToArray()))
-                                 + "|_" + (definition.CreateParameterConstructor ? "1" : "0");
+                                 + "|_" + (definition.CreateParameterConstructor ? 1 : 0);
 
                 // resolve on cache hit using typeKey
 
